@@ -22,7 +22,7 @@ get_current_dayofweek = lambda action: time.strftime("%A", time.localtime(time.t
 SLEEPTIME = 0.5           # 每次尝试的间隔时间（秒）
 STARTTIME = "08:00:00"  # 预约正式开放时间（开始时间，北京时间），到点后才正式提交预约
 LOGIN_AHEAD = 5          # 提前多少秒开始登录（即 开始登录时间 = STARTTIME - LOGIN_AHEAD 秒）
-ENDTIME = "08:01:00"    # 停止尝试的时间（超过学校关闭时间1分钟）
+ENDTIME = "23:01:00"    # 停止尝试的时间（超过学校关闭时间1分钟）
 ENABLE_SLIDER = False   # 是否启用滑块验证
 MAX_ATTEMPT = 2         # 单次预约的最大尝试次数
 RESERVE_NEXT_DAY = True # 预约明天的座位而不是今天
