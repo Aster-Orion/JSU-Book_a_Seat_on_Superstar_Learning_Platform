@@ -131,5 +131,3 @@ dmypy.json
 test.json
 
 # Local user config
-config.json
-config.local.json
