@@ -76,20 +76,24 @@ class reserve:
 
     def _get_page_token(self, url, require_value=False):
         """获取预约页面的 token 和加密值"""
-        response = self.requests.get(url=url, verify=False)
-        html = response.content.decode("utf-8")
-        
+        try:
+            response = self.requests.get(url=url, verify=False)
+            html = response.content.decode("utf-8")
+        except Exception as e:
+            logging.error(f"获取预约页面失败 {url}: {e}")
+            return "", ""
+
         # 从 hidden input submit_enc 中提取 token
         matches = re.findall(r'id="submit_enc"\s+value="(.*?)"', html)
         value_matches = re.findall(r'value="(.*?)"', html) if require_value else None
-        
+
         if not matches:
-            logging.error(f"Failed to get token from {url}")
+            logging.error(f"Failed to get token from {url}, HTTP状态={response.status_code}, 返回内容前500字: {html[:500]}")
             return "", ""
         if require_value and not value_matches:
-            logging.error(f"Failed to get submit value from {url}")
+            logging.error(f"Failed to get submit value from {url}, HTTP状态={response.status_code}, 返回内容前500字: {html[:500]}")
             return matches[0], ""
-            
+
         return matches[0] if matches else "", value_matches[0] if value_matches else ""
 
     def get_login_status(self):
@@ -98,6 +102,7 @@ class reserve:
         self.requests.get(url=self.login_page, verify=False)
 
     def login(self, username, password):
+        raw_username = username
         username = AES_Encrypt(username)
         password = AES_Encrypt(password)
         parm = {
@@ -107,16 +112,19 @@ class reserve:
             "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
             "t": True,
         }
-        jsons = self.requests.post(url=self.login_url, params=parm, verify=False)
-        obj = jsons.json()
-        if obj["status"]:
-            logging.info(f"用户 {username} 登录成功")
+        try:
+            jsons = self.requests.post(url=self.login_url, params=parm, verify=False)
+            obj = jsons.json()
+        except Exception as e:
+            logging.error(f"用户 {raw_username} 登录请求异常: {e}")
+            return (False, str(e))
+        if obj.get("status"):
+            logging.info(f"用户 {raw_username} 登录成功")
             return (True, "")
         else:
-            logging.info(
-                f"用户 {username} 登录失败。请检查您的密码和用户名! "
-            )
-            return (False, obj["msg2"])
+            msg = obj.get("msg2") or obj.get("msg") or "未知错误"
+            logging.error(f"用户 {raw_username} 登录失败，原因: {msg}，服务器返回: {obj}")
+            return (False, msg)
 
     def roomid(self, encode):
         """列出所有可用的房间及座位信息"""
@@ -308,7 +316,7 @@ class reserve:
                     time.sleep(self.sleep_time)
                     attempt -= 1
                 if not suc:
-                    logging.error(f"时段 {seg_start}~{seg_end} 预约失败，跳过后续时段")
+                    logging.error(f"✗ 预约失败 - 房间:{roomid} 座位:{seat} 时段:{seg_start}~{seg_end}，已重试 {self.max_attempt} 次，跳过后续时段")
                     return False
         return True
 
@@ -336,31 +344,42 @@ class reserve:
         }
         
         logging.info(f"提交预约 - 房间:{roomid} 座位:{seatid} 时间:{times[0]}-{times[1]} 日期:{day}")
-        
+
         # 加密参数并发送请求
         parm["enc"] = verify_param(parm, value)
-        html = self.requests.post(url=url, params=parm, verify=True).content.decode("utf-8")
-        result = json.loads(html)
-        
+        try:
+            resp = self.requests.post(url=url, params=parm, verify=True)
+            html = resp.content.decode("utf-8")
+            logging.info(f"预约请求返回 - HTTP状态={resp.status_code} 响应内容={html}")
+        except Exception as e:
+            logging.error(f"预约请求异常 房间:{roomid} 座位:{seatid}: {e}")
+            return False
+
+        try:
+            result = json.loads(html)
+        except Exception as e:
+            logging.error(f"预约响应解析失败（非 JSON）房间:{roomid} 座位:{seatid}: {e}，原始内容={html}")
+            return False
+
         # 处理预约结果
-        if result["success"]:
-            seat_info = result['data']['seatReserve']
+        if result.get("success"):
+            seat_info = result.get('data', {}).get('seatReserve', {})
             start_time = times[0]
             end_time = times[1]
-            logging.info(f"✓ 预约成功 - 座位:{seat_info['seatNum']} {start_time}~{end_time}")
-            
+            logging.info(f"✓ 预约成功 - 座位:{seat_info.get('seatNum')} {start_time}~{end_time}")
+
             # 保存成功结果用于后续邮件
             self.success_results.append({
-                'seatNum': seat_info['seatNum'],
+                'seatNum': seat_info.get('seatNum'),
                 'startTime': start_time,
                 'endTime': end_time,
                 'roomId': roomid,
                 'day': str(day)
             })
         else:
-            logging.info("✗ 预约失败")
+            logging.error(f"✗ 预约失败 房间:{roomid} 座位:{seatid}，服务器返回: {result}")
 
-        return result["success"]
+        return result.get("success")
 
     def send_all_results_email(self):
         """发送合并的邮件（包含所有成功的预约）"""
