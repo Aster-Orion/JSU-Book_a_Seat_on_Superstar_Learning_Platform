@@ -22,7 +22,7 @@ get_current_dayofweek = lambda action: time.strftime("%A", time.localtime(time.t
 SLEEPTIME = 0.5           # 每次尝试的间隔时间（秒）
 STARTTIME = "08:00:00"  # 预约正式开放时间（开始时间，北京时间），到点后才正式提交预约
 LOGIN_AHEAD = 5          # 提前多少秒开始登录（即 开始登录时间 = STARTTIME - LOGIN_AHEAD 秒）
-ENDTIME = "08:01:30"    # 停止尝试的时间（超过学校关闭时间1分钟）
+ENDTIME = "08:01:00"    # 停止尝试的时间（超过学校关闭时间1分钟）
 ENABLE_SLIDER = False   # 是否启用滑块验证
 MAX_ATTEMPT = 2         # 单次预约的最大尝试次数
 RESERVE_NEXT_DAY = True # 预约明天的座位而不是今天
@@ -81,7 +81,6 @@ def login_all(users, usernames, passwords, action):
         if not login_ok:
             logging.error(f"用户 {username} 登录失败，跳过该用户预约，原因: {login_msg}")
             continue
-        s.requests.headers.update({'Host': 'office.chaoxing.com'})
         tasks.append((s, times, roomid, seatid, index))
 
     return tasks
@@ -194,7 +193,6 @@ def debug(users, action=False):
         s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
         s.get_login_status()
         s.login(username, password)
-        s.requests.headers.update({'Host': 'office.chaoxing.com'})
         suc = s.submit(times, roomid, seatid, action)
         
         # 发送邮件并返回
@@ -210,8 +208,7 @@ def get_roomid(args1, args2):
     s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
     s.get_login_status()
     s.login(username=username, password=password)
-    s.requests.headers.update({'Host': 'office.chaoxing.com'})
-    
+
     deptid_enc = input("请输入deptIdEnc: ")
     s.roomid(deptid_enc)
 
