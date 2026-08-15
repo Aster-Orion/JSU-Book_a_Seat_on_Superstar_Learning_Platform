@@ -26,7 +26,11 @@ class reserve:
     ):
         # API 端点
         self.login_page = "https://passport2.chaoxing.com/mlogin?loginType=1&newversion=true&fid="
-        self.url = "https://office.chaoxing.com/front/third/apps/seat/code?id={}&seatNum={}"
+        # 预约“选座页”（含 submit_enc 隐藏域）。注意：/seat/code 是“签到”页，不是预约页，勿用。
+        self.select_url = (
+            "https://office.chaoxing.com/front/third/apps/seat/select"
+            "?deptIdEnc={deptIdEnc}&id={roomid}&day={day}&backLevel=2&fidEnc={deptIdEnc}"
+        )
         self.submit_url = "https://office.chaoxing.com/data/apps/seat/submit"
         self.login_url = "https://passport2.chaoxing.com/fanyalogin"
         
@@ -37,13 +41,49 @@ class reserve:
         config = json.load(open("config.json", encoding="utf-8"))
         self.mail_config = config.get("mail", {})
         self.receivers = config.get("receivers", [])
+        # 学校/院系的加密 ID（deptIdEnc），用于选座页与提交接口；为固定值，从选座页 URL 或抓包获取
+        self.deptIdEnc = config.get("deptIdEnc", "")
         
         # HTTP 会话
         self.requests = requests.session()
-        self.token_pattern = re.compile("token = '(.*?)'")
+        # 关键：忽略系统代理 / 环境变量代理，直连服务器。
+        # Windows 上 requests 会读取系统代理（如 127.0.0.1:7890 的 Clash），
+        # 一旦代理软件未正确接管本地流量，就会抛 ProxyError / FileNotFoundError 导致连不上。
+        # chaoxing 是国内服务，直连即可，这里强制关闭代理读取（只影响本脚本，不影响浏览器）。
+        self.requests.trust_env = False
+
+        # 与抓包一致的移动端 User-Agent（Android Chrome），用于所有请求。
+        # 请求头中不再手动指定 Host，requests 会根据目标 URL 自动填充正确的 Host，
+        # 避免登录后切换域名（passport2 -> office）时 Host 头错乱导致服务器返回登录页。
+        self.user_agent = (
+            "Mozilla/5.0 (Linux; Android 15; Pixel 9) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Mobile Safari/537.36"
+        )
+        self.requests.headers.update({
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+        })
+
+        # 登录接口请求头（passport2.chaoxing.com）
+        self.login_headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://passport2.chaoxing.com",
+            "Referer": "https://passport2.chaoxing.com/mlogin?loginType=1&newversion=true",
+        }
+
+        # 预约页面 / 提交接口请求头（office.chaoxing.com）
+        self.seat_headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://office.chaoxing.com/",
+        }
+
+        # 滑块验证码请求头（仅 enable_slider=True 时使用）
         self.headers = {
             "Referer": "https://office.chaoxing.com/",
-            "Host": "captcha.chaoxing.com",
             "Pragma": "no-cache",
             "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
             "Sec-Ch-Ua-Mobile": "?0",
@@ -53,19 +93,13 @@ class reserve:
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "User-Agent": self.user_agent,
         }
-        self.login_headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "cache-control": "no-cache",
-            "Connection": "keep-alive",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.3 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1 wechatdevtools/1.05.2109131 MicroMessenger/8.0.5 Language/zh_CN webview/16364215743155638",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Host": "passport2.chaoxing.com",
-        }
+
+        # 从预约页面提取 submit_enc 隐藏域的 value（后续 MD5 签名的种子）
+        self.token_pattern = re.compile(
+            r'<input[^>]+(?:id|name)=["\']submit_enc["\'][^>]*value=["\'](.*?)["\']'
+        )
 
         # 参数设置
         self.sleep_time = sleep_time
@@ -74,46 +108,66 @@ class reserve:
         self.reserve_next_day = reserve_next_day
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-    def _get_page_token(self, url, require_value=False):
-        """获取预约页面的 token 和加密值"""
+    def _get_page_token(self, roomid, day):
+        """获取预约“选座页”的 submit_enc 值（后续 MD5 签名的种子）
+
+        返回 submit_enc 隐藏域的 value；失败返回空字符串。
+        """
+        url = self.select_url.format(deptIdEnc=self.deptIdEnc, roomid=roomid, day=day)
+        # 携带移动端 UA + Referer，否则服务器可能判定会话无效，重定向到登录页 / 验证页，
+        # 导致返回的是 HTML 而非包含 submit_enc 的选座页面。
+        headers = dict(self.seat_headers)
+        headers["Referer"] = "https://office.chaoxing.com/front/third/apps/seat/"
         try:
-            response = self.requests.get(url=url, verify=False)
+            response = self.requests.get(url=url, headers=headers, verify=False)
             html = response.content.decode("utf-8")
         except Exception as e:
             logging.error(f"获取预约页面失败 {url}: {e}")
-            return "", ""
+            return ""
 
-        # 从 hidden input submit_enc 中提取 token
-        matches = re.findall(r'id="submit_enc"\s+value="(.*?)"', html)
-        value_matches = re.findall(r'value="(.*?)"', html) if require_value else None
+        # 兼容多种 HTML 写法：value 与 id/name 顺序不定、单双引号混用
+        patterns = [
+            r'id=["\']submit_enc["\'][^>]*value=["\'](.*?)["\']',
+            r'value=["\'](.*?)["\'][^>]*id=["\']submit_enc["\']',
+            r'name=["\']submit_enc["\'][^>]*value=["\'](.*?)["\']',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, html)
+            if m:
+                return m.group(1)
 
-        if not matches:
-            logging.error(f"Failed to get token from {url}, HTTP状态={response.status_code}, 返回内容前500字: {html[:500]}")
-            return "", ""
-        if require_value and not value_matches:
-            logging.error(f"Failed to get submit value from {url}, HTTP状态={response.status_code}, 返回内容前500字: {html[:500]}")
-            return matches[0], ""
-
-        return matches[0] if matches else "", value_matches[0] if value_matches else ""
+        logging.error(
+            f"Failed to get submit_enc from {url}, HTTP状态={response.status_code}, "
+            f"返回内容前800字: {html[:800]}"
+        )
+        return ""
 
     def get_login_status(self):
-        """获取登录状态（初始化会话）"""
-        self.requests.headers = self.login_headers
-        self.requests.get(url=self.login_page, verify=False)
+        """获取登录状态（初始化会话，让服务器写入 JSESSIONID 等前置 Cookie）"""
+        try:
+            self.requests.get(url=self.login_page, headers=self.login_headers, verify=False)
+        except Exception as e:
+            # 获取登录页面失败不影响后续登录，仅记录
+            logging.warning(f"获取登录页面失败（可忽略）: {e}")
 
     def login(self, username, password):
         raw_username = username
         username = AES_Encrypt(username)
         password = AES_Encrypt(password)
         parm = {
-            "fid": -1,
+            "fid": "-1",
             "uname": username,
             "password": password,
             "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
-            "t": True,
+            "t": "true",
         }
         try:
-            jsons = self.requests.post(url=self.login_url, params=parm, verify=False)
+            # 关键修复：登录凭证必须以表单体（data=）提交，而非 URL 查询参数（params=）。
+            # 抓包显示 fanyalogin 的 Content-Type 为 application/x-www-form-urlencoded 且有请求体。
+            # 使用 data= 才能让服务器正确回写 p_auth_token / UID / _uid 等会话 Cookie。
+            jsons = self.requests.post(
+                url=self.login_url, data=parm, headers=self.login_headers, verify=False
+            )
             obj = jsons.json()
         except Exception as e:
             logging.error(f"用户 {raw_username} 登录请求异常: {e}")
@@ -271,10 +325,19 @@ class reserve:
             cur = nxt
         return segments
 
+    def _get_reserve_day(self, action):
+        """计算要预约的日期（返回 datetime.date）"""
+        delta_day = 1 if self.reserve_next_day else 0
+        day = datetime.date.today() + datetime.timedelta(days=delta_day)
+        if action:
+            day += datetime.timedelta(days=1)  # GitHub Action 时区调整
+        return day
+
     def submit(self, times, roomid, seatid, action):
         """提交预约请求"""
         start_time, end_time = times[0], times[1]
-        
+        day = self._get_reserve_day(action)
+
         # 切分超过5小时的时间段
         segments = self._split_times(start_time, end_time)
         if len(segments) > 1:
@@ -285,33 +348,30 @@ class reserve:
             for seg_start, seg_end in segments:
                 suc = False
                 attempt = self.max_attempt
-                
+
                 # 重试逻辑
                 while not suc and attempt > 0:
-                    # 获取预约页面的token和加密参数
-                    token, value = self._get_page_token(
-                        self.url.format(roomid, seat), require_value=True
-                    )
-                    
-                    # 如果启用滑块验证则解析验证码
+                    # 每次提交前重新获取选座页的 submit_enc，避免“安全验证超时(303)”
+                    value = self._get_page_token(roomid, day)
+
+                    # 如果启用滑块验证则解析验证码（本校 securityVerify=0，通常无需验证码）
                     captcha = self.resolve_captcha() if self.enable_slider else ""
-                    
+
                     # 提交预约
                     suc = self.get_submit(
                         self.submit_url,
                         times=[seg_start, seg_end],
-                        token=token,
                         roomid=roomid,
                         seatid=seat,
                         captcha=captcha,
-                        action=action,
+                        day=day,
                         value=value,
                     )
-                    
+
                     if suc:
                         logging.info(f"✓ 时段 {seg_start}~{seg_end} 预约成功")
                         break
-                    
+
                     # 重试等待
                     time.sleep(self.sleep_time)
                     attempt -= 1
@@ -321,34 +381,37 @@ class reserve:
         return True
 
     def get_submit(
-        self, url, times, token, roomid, seatid, captcha="", action=False, value=""
+        self, url, times, roomid, seatid, captcha="", day=None, value=""
     ):
         """提交预约表单并处理响应"""
-        # 计算预约日期
-        delta_day = 1 if self.reserve_next_day else 0
-        day = datetime.date.today() + datetime.timedelta(days=delta_day)
-        if action:
-            day += datetime.timedelta(days=1)  # GitHub Action 时区调整
-        
-        # 构建预约参数
+        if day is None:
+            day = self._get_reserve_day(False)
+
+        # 构建预约参数（与前端 doSubmit 的 paramObj 一致，enc 字段稍后追加）
         parm = {
+            "deptIdEnc": self.deptIdEnc,
             "roomId": roomid,
+            "day": str(day),
             "startTime": times[0],
             "endTime": times[1],
-            "day": str(day),
             "seatNum": seatid,
             "captcha": captcha,
-            "token": token,
-            "type": "1",
-            "verifyData": "1",
+            "wyToken": "",   # 风险检测 token；本校 riskCheckOpen 未开启，恒为空
         }
-        
+
         logging.info(f"提交预约 - 房间:{roomid} 座位:{seatid} 时间:{times[0]}-{times[1]} 日期:{day}")
 
-        # 加密参数并发送请求
+        # 计算 enc 签名：MD5(排序后的 [k=v] + [submit_enc值])，与前端 submitVerify 一致
         parm["enc"] = verify_param(parm, value)
+
+        # 提交参数必须以表单体（data=）提交；enc 需基于不含 enc 的 paramObj 计算
+        headers = dict(self.seat_headers)
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        headers["Referer"] = self.select_url.format(
+            deptIdEnc=self.deptIdEnc, roomid=roomid, day=day
+        )
         try:
-            resp = self.requests.post(url=url, params=parm, verify=True)
+            resp = self.requests.post(url=url, data=parm, headers=headers, verify=False)
             html = resp.content.decode("utf-8")
             logging.info(f"预约请求返回 - HTTP状态={resp.status_code} 响应内容={html}")
         except Exception as e:
