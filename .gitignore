@@ -130,4 +130,5 @@ dmypy.json
 
 test.json
 
-# Local user config
+# Local user config (contains real credentials - never commit)
+config.json
