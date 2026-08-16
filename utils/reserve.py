@@ -328,15 +328,23 @@ class reserve:
     def _get_reserve_day(self, action):
         """计算要预约的日期（返回 datetime.date）"""
         delta_day = 1 if self.reserve_next_day else 0
-        day = datetime.date.today() + datetime.timedelta(days=delta_day)
         if action:
-            day += datetime.timedelta(days=1)  # GitHub Action 时区调整
-        return day
+            # GitHub runner 为 UTC 时区，北京时间 = UTC + 8h。
+            # 原实现用 `day += 1 天` 做“时区补偿”，会与“预约次日(+1)”重复累加：
+            # 北京时间 08:00（= UTC 00:00）时 UTC 日期已与北京同一天，再 +1 就变成后天，
+            # 选座页因“后天不可预约”返回“出错了”页，导致拿不到 submit_enc。
+            today = datetime.datetime.fromtimestamp(
+                time.time() + 8 * 3600, tz=datetime.timezone.utc
+            ).date()
+        else:
+            today = datetime.date.today()
+        return today + datetime.timedelta(days=delta_day)
 
     def submit(self, times, roomid, seatid, action):
         """提交预约请求"""
         start_time, end_time = times[0], times[1]
         day = self._get_reserve_day(action)
+        logging.info(f"本次预约目标日期: {day}（RESERVE_NEXT_DAY={self.reserve_next_day}, action={action}）")
 
         # 切分超过5小时的时间段
         segments = self._split_times(start_time, end_time)
