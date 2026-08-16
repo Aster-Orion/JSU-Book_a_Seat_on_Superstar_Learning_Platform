@@ -23,6 +23,7 @@ class reserve:
         max_attempt=10,
         enable_slider=False,
         reserve_next_day=False,
+        segment_interval=0.3,
     ):
         # API 端点
         self.login_page = "https://passport2.chaoxing.com/mlogin?loginType=1&newversion=true&fid="
@@ -106,6 +107,7 @@ class reserve:
         self.max_attempt = max_attempt
         self.enable_slider = enable_slider
         self.reserve_next_day = reserve_next_day
+        self.segment_interval = segment_interval
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
     def _get_page_token(self, roomid, day):
@@ -353,7 +355,11 @@ class reserve:
 
         # 逐个座位、逐个时段提交预约
         for seat in seatid:
-            for seg_start, seg_end in segments:
+            for seg_index, (seg_start, seg_end) in enumerate(segments):
+                # 同一座位不同时段之间加间隔，给服务器缓冲；第一段仍准点发送
+                if seg_index > 0:
+                    time.sleep(self.segment_interval)
+
                 suc = False
                 attempt = self.max_attempt
 

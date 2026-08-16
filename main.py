@@ -20,6 +20,7 @@ get_current_dayofweek = lambda action: time.strftime("%A", time.localtime(time.t
 
 # === 配置参数 ===
 SLEEPTIME = 0.5           # 每次尝试的间隔时间（秒）
+SEGMENT_INTERVAL = 0.4    # 同一座位不同时段之间的提交间隔（秒），给服务器缓冲；第一段仍准点发送
 STARTTIME = "08:00:00"  # 预约正式开放时间（开始时间，北京时间），到点后才正式提交预约
 LOGIN_AHEAD = 5          # 提前多少秒开始登录（即 开始登录时间 = STARTTIME - LOGIN_AHEAD 秒）
 ENDTIME = "23:59:00"    # 停止尝试的时间（超过学校关闭时间1分钟）
@@ -75,7 +76,7 @@ def login_all(users, usernames, passwords, action):
         logging.info(f"开始登录: {username}")
 
         # 创建预约实例并登录（此时不提交预约）
-        s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
+        s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY, segment_interval=SEGMENT_INTERVAL)
         s.get_login_status()
         login_ok, login_msg = s.login(username, password)
         if not login_ok:
@@ -190,7 +191,7 @@ def debug(users, action=False):
         logging.info(f"预约: {username} - {times} - {seatid}")
         
         # 执行预约
-        s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
+        s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY, segment_interval=SEGMENT_INTERVAL)
         s.get_login_status()
         s.login(username, password)
         suc = s.submit(times, roomid, seatid, action)
@@ -205,7 +206,7 @@ def get_roomid(args1, args2):
     username = input("请输入用户名: ")
     password = input("请输入密码: ")
     
-    s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
+    s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY, segment_interval=SEGMENT_INTERVAL)
     s.get_login_status()
     s.login(username=username, password=password)
 
