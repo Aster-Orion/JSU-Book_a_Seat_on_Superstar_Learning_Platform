@@ -27,6 +27,7 @@ ENDTIME = "08:01:00"    # 停止尝试的时间（超过学校关闭时间1分�
 ENABLE_SLIDER = False   # 是否启用滑块验证
 MAX_ATTEMPT = 2         # 单次预约的最大尝试次数
 RESERVE_NEXT_DAY = True # 预约明天的座位而不是今天
+ENABLE_EMAIL = True     # 是否开启邮箱提醒（预约失败或开始时间大于结束时间时发送）
 
 
 def time_add_seconds(hms, seconds):
@@ -210,9 +211,11 @@ def main(users, action=False):
 
     # 超时仍未全部成功时，发送失败邮件提醒（仅当预约失败或开始时间大于结束时间）
     failures = collect_failures(users, success_list, action, usernames)
-    if failures:
+    if failures and ENABLE_EMAIL:
         logging.info(f"预约存在失败项，发送失败邮件提醒，共 {len(failures)} 条")
         send_failure_email(failures)
+    elif failures:
+        logging.info(f"预约存在 {len(failures)} 条失败项，但邮箱提醒已关闭（ENABLE_EMAIL=False），不发送邮件")
     else:
         logging.info("所有座位均已成功预约，不发送邮件")
 
