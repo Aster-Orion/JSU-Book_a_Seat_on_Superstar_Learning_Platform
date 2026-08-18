@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 from .encrypt import AES_Encrypt, generate_captcha_key, enc, verify_param
-from .reserve import reserve
+from .reserve import reserve, send_failure_email
 
 def _fetch_env_variables(env_name, action):
     try:

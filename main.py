@@ -12,7 +12,7 @@ import logging
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-from utils import reserve, get_user_credentials
+from utils import reserve, get_user_credentials, send_failure_email
 
 # 时间获取函数（支持时区偏移）
 get_current_time = lambda action: time.strftime("%H:%M:%S", time.localtime(time.time() + 8*3600)) if action else time.strftime("%H:%M:%S", time.localtime(time.time()))
@@ -23,7 +23,7 @@ SLEEPTIME = 0.5           # 每次尝试的间隔时间（秒）
 SEGMENT_INTERVAL = 0.4    # 同一座位不同时段之间的提交间隔（秒），给服务器缓冲；第一段仍准点发送
 STARTTIME = "08:00:00"  # 预约正式开放时间（开始时间，北京时间），到点后才正式提交预约
 LOGIN_AHEAD = 5          # 提前多少秒开始登录（即 开始登录时间 = STARTTIME - LOGIN_AHEAD 秒）
-ENDTIME = "08:01:00"    # 停止尝试的时间（超过学校关闭时间1分钟）
+ENDTIME = "20:01:00"    # 停止尝试的时间（超过学校关闭时间1分钟）
 ENABLE_SLIDER = False   # 是否启用滑块验证
 MAX_ATTEMPT = 2         # 单次预约的最大尝试次数
 RESERVE_NEXT_DAY = True # 预约明天的座位而不是今天
@@ -108,6 +108,55 @@ def send_success_email(tasks):
             break  # 只发送一次（合并所有结果）
 
 
+def collect_failures(users, success_list, action, usernames):
+    """收集预约失败信息（预约请求失败 或 开始时间大于结束时间）
+
+    返回失败信息列表，每个元素为 dict，用于发送失败邮件。
+    """
+    current_dayofweek = get_current_dayofweek(action)
+    failures = []
+
+    for index, user in enumerate(users):
+        username, password, times, roomid, seatid, daysofweek = user.values()
+
+        # 跳过今天无需预约的用户
+        if not should_reserve_today(daysofweek, current_dayofweek):
+            continue
+
+        # 座位ID转为列表（若为字符串）
+        if isinstance(seatid, str):
+            seatid = [seatid]
+
+        # Action 模式下账号被环境变量覆盖
+        if action:
+            username = usernames.split(',')[index]
+
+        start_time, end_time = times[0], times[1]
+
+        # 条件一：开始时间大于结束时间（配置异常）
+        if start_time > end_time:
+            failures.append({
+                "username": username,
+                "roomid": roomid,
+                "seatid": ",".join(seatid),
+                "start_time": start_time,
+                "end_time": end_time,
+                "reason": "开始时间大于结束时间",
+            })
+        # 条件二：预约请求失败（未预约成功）
+        elif not success_list[index]:
+            failures.append({
+                "username": username,
+                "roomid": roomid,
+                "seatid": ",".join(seatid),
+                "start_time": start_time,
+                "end_time": end_time,
+                "reason": "预约请求失败",
+            })
+
+    return failures
+
+
 def main(users, action=False):
     """主预约流程：先等待到登录时间登录，再等到开放时间正式预约"""
     current_time = get_current_time(action)
@@ -159,8 +208,13 @@ def main(users, action=False):
         # 控制轮询间隔，避免登录失败/无任务时空转
         time.sleep(SLEEPTIME)
 
-    # 超时仍未全部成功时，发送一次邮件（含部分成功的结果）
-    # send_success_email(tasks)
+    # 超时仍未全部成功时，发送失败邮件提醒（仅当预约失败或开始时间大于结束时间）
+    failures = collect_failures(users, success_list, action, usernames)
+    if failures:
+        logging.info(f"预约存在失败项，发送失败邮件提醒，共 {len(failures)} 条")
+        send_failure_email(failures)
+    else:
+        logging.info("所有座位均已成功预约，不发送邮件")
 
 
 def debug(users, action=False):

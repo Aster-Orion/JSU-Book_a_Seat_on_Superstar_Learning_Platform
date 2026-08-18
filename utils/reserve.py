@@ -16,6 +16,55 @@ def get_date(day_offset: int = 0):
     return tomorrow
 
 
+def send_failure_email(failures):
+    """发送失败邮件提醒（仅当预约请求失败，或开始时间大于结束时间时调用）
+
+    failures: 失败信息列表，每个元素为 dict，字段：
+        username / roomid / seatid / start_time / end_time / reason
+    """
+    if not failures:
+        return
+
+    config = json.load(open("config.json", encoding="utf-8"))
+    mail_config = config.get("mail", {})
+    receivers = config.get("receivers", [])
+    if not mail_config or not receivers:
+        logging.warning("未配置邮件信息，跳过失败邮件发送")
+        return
+
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.header import Header
+
+    # 构建邮件内容
+    email_lines = ["超星图书馆预约失败提醒！", ""]
+    for idx, f in enumerate(failures, 1):
+        email_lines.append(f"失败 {idx}:")
+        email_lines.append(f"  账号: {f.get('username', '')}")
+        email_lines.append(f"  房间代号: {f.get('roomid', '')}")
+        email_lines.append(f"  座位: {f.get('seatid', '')}")
+        email_lines.append(f"  开始时间: {f.get('start_time', '')}")
+        email_lines.append(f"  结束时间: {f.get('end_time', '')}")
+        email_lines.append(f"  失败原因: {f.get('reason', '')}")
+        email_lines.append("")
+
+    email_content = "\n".join(email_lines)
+
+    # 发送邮件
+    try:
+        message = MIMEText(email_content, "plain", "utf-8")
+        message["From"] = Header(mail_config["auth"]["user"])
+        message["To"] = Header(",".join(receivers))
+        message["Subject"] = Header(f"超星图书馆预约失败提醒 - 共{len(failures)}条")
+
+        smtpObj = smtplib.SMTP_SSL(mail_config["host"], mail_config["port"])
+        smtpObj.login(mail_config["auth"]["user"], mail_config["auth"]["pass"])
+        smtpObj.sendmail(mail_config["auth"]["user"], receivers, message.as_string())
+        logging.info("✓ 失败邮件发送成功")
+    except Exception as e:
+        logging.error(f"✗ 失败邮件发送失败: {str(e)}")
+
+
 class reserve:
     def __init__(
         self,
