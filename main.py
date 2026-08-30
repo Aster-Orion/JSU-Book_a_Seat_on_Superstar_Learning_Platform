@@ -12,11 +12,12 @@ import logging
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-from utils import reserve, get_user_credentials, send_failure_email
+from utils import reserve, get_user_credentials, send_failure_email, SeatSignIn, send_sign_failure_email
 
 # 时间获取函数（支持时区偏移）
 get_current_time = lambda action: time.strftime("%H:%M:%S", time.localtime(time.time() + 8*3600)) if action else time.strftime("%H:%M:%S", time.localtime(time.time()))
-get_current_dayofweek = lambda action: time.strftime("%A", time.localtime(time.time() + 8*3600)) if action else time.strftime("%A", time.localtime(time.time()))
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+get_current_dayofweek = lambda action: WEEKDAYS[time.localtime(time.time() + 8*3600).tm_wday] if action else WEEKDAYS[time.localtime(time.time()).tm_wday]
 
 # === 配置参数 ===
 SLEEPTIME = 0.5           # 每次尝试的间隔时间（秒）
@@ -28,6 +29,15 @@ ENABLE_SLIDER = False   # 是否启用滑块验证
 MAX_ATTEMPT = 2         # 单次预约的最大尝试次数
 RESERVE_NEXT_DAY = True # 预约明天的座位而不是今天
 ENABLE_EMAIL = True     # 是否开启邮箱提醒（预约失败或开始时间大于结束时间时发送）
+
+# === 签到 / 签退配置参数 ===
+ENABLE_RESERVE = True   # 是否开启自动预约（默认开启，保持原行为）
+ENABLE_SIGNIN = True   # 是否开启自动签到
+ENABLE_SIGNOUT = True  # 是否开启自动签退
+SIGNIN_TIME = "08:00:30"  # 签到时间（北京时间），须在 STARTTIME~ENDTIME 之间，与预约共用窗口
+SIGNOUT_TIME = "21:29:30" # 签退开始时间（北京时间）
+SIGNOUT_END_TIME = "21:30:00" # 签退结束时间（北京时间），超过后停止重试
+SIGNOUT_LEAD = 300       # 签退提前量（秒）：定时器早于签退时间启动时的允许提前量，早于该时间则本次跳过签退
 
 
 def time_add_seconds(hms, seconds):
@@ -158,11 +168,125 @@ def collect_failures(users, success_list, action, usernames):
     return failures
 
 
-def main(users, action=False):
-    """主预约流程：先等待到登录时间登录，再等到开放时间正式预约"""
+def _sign_login(users, usernames, passwords, action, action_name):
+    """登录所有今天需要签到/签退的用户，返回任务列表。
+
+    每个任务为 dict：
+        s: SeatSignIn 实例（登录失败时为 None）
+        roomid: 房间ID
+        seatid: 座位号列表
+        username: 账号
+        index: 在 users 中的下标
+        login_err: 登录失败原因（成功为 None）
+    """
+    current_dayofweek = get_current_dayofweek(action)
+    tasks = []
+    for index, user in enumerate(users):
+        username, password, times, roomid, seatid, daysofweek = user.values()
+        if isinstance(seatid, str):
+            seatid = [seatid]
+        if not should_reserve_today(daysofweek, current_dayofweek):
+            continue
+        if action:
+            username, password = usernames.split(',')[index], passwords.split(',')[index]
+
+        logging.info(f"开始{action_name}登录: {username}")
+        s = SeatSignIn()
+        s.get_login_status()
+        login_ok, login_msg = s.login(username, password)
+        if not login_ok:
+            logging.error(f"用户 {username} {action_name}登录失败，原因: {login_msg}")
+        tasks.append({
+            "s": s if login_ok else None,
+            "roomid": roomid,
+            "seatid": seatid,
+            "username": username,
+            "index": index,
+            "login_err": None if login_ok else login_msg,
+        })
+    return tasks
+
+
+def _sign_retry_once(tasks, action_name, done, fail_msg, execute):
+    """执行一轮签到/签退：对尚未完成的座位各尝试一次，更新 done 与 fail_msg。"""
+    for task in tasks:
+        if task["login_err"]:
+            continue
+        for seat in task["seatid"]:
+            key = (task["index"], seat)
+            if done.get(key):
+                continue
+            result = execute(task["s"], task["roomid"], seat)
+            if result.get("success"):
+                done[key] = True
+                logging.info(f"{action_name}成功 {task['username']} - 房间{task['roomid']} 座位{seat}")
+            else:
+                fail_msg[key] = result.get("message")
+                logging.info(f"{action_name}失败 {task['username']} - 房间{task['roomid']} 座位{seat}: {result.get('message')}")
+
+
+def _sign_all_done(tasks, done):
+    """判断所有可签到/签退座位是否都已完成（登录失败的不计入重试）。"""
+    return all(
+        done.get((t["index"], seat))
+        for t in tasks if not t["login_err"]
+        for seat in t["seatid"]
+    )
+
+
+def _send_sign_failures(tasks, done, fail_msg, action_name):
+    """汇总签到/签退失败项并发送邮件提醒（登录失败 + 超时未完成的座位）。"""
+    failures = []
+    for task in tasks:
+        if task["login_err"]:
+            failures.append({
+                "username": task["username"],
+                "roomid": task["roomid"],
+                "seatid": ",".join(str(x) for x in task["seatid"]),
+                "reason": f"登录失败: {task['login_err']}",
+            })
+            continue
+        for seat in task["seatid"]:
+            if not done.get((task["index"], seat)):
+                failures.append({
+                    "username": task["username"],
+                    "roomid": task["roomid"],
+                    "seatid": seat,
+                    "reason": fail_msg.get((task["index"], seat), f"{action_name}失败"),
+                })
+
+    if failures:
+        if ENABLE_EMAIL:
+            logging.info(f"{action_name}存在 {len(failures)} 条失败项，发送失败邮件提醒")
+            send_sign_failure_email(failures, action_name)
+        else:
+            logging.info(f"{action_name}存在 {len(failures)} 条失败项，但邮箱提醒已关闭（ENABLE_EMAIL=False），不发送邮件")
+    else:
+        logging.info(f"所有座位均已成功{action_name}")
+
+
+def signout_all(users, usernames, passwords, action):
+    """对已签到座位执行自动签退（窗口 [SIGNOUT_TIME, SIGNOUT_END_TIME]，超时停止重试）"""
+    wait_until(SIGNOUT_TIME, action)
+    logging.info(f"到达签退时间 {SIGNOUT_TIME}，开始签退（重试窗口 {SIGNOUT_TIME}~{SIGNOUT_END_TIME}）")
+
+    tasks = _sign_login(users, usernames, passwords, action, "签退")
+    done, fail_msg = {}, {}
+    while get_current_time(action) < SIGNOUT_END_TIME:
+        _sign_retry_once(tasks, "签退", done, fail_msg, lambda s, r, seat: s.execute_signout(r, seat))
+        if _sign_all_done(tasks, done):
+            break
+        time.sleep(SLEEPTIME)
+
+    _send_sign_failures(tasks, done, fail_msg, "签退")
+
+
+def main(users=False, action=False):
+    """主流程：先预约+签到（共用 [STARTTIME, ENDTIME] 窗口），再签退（[SIGNOUT_TIME, SIGNOUT_END_TIME] 窗口）"""
     current_time = get_current_time(action)
     logging.info(f"开始时间 {current_time} ({'action' if action else 'preview'})")
-    logging.info(f"预约设置: 开放时间={STARTTIME} 提前登录={LOGIN_AHEAD}s 结束时间={ENDTIME} 睡眠={SLEEPTIME}s 滑块={ENABLE_SLIDER} 次日={RESERVE_NEXT_DAY}")
+    logging.info(f"预约设置: 开放时间={STARTTIME} 提前登录={LOGIN_AHEAD}s 结束时间={ENDTIME} 睡眠={SLEEPTIME}s 滑块={ENABLE_SLIDER} 次日={RESERVE_NEXT_DAY} 启用={ENABLE_RESERVE}")
+    logging.info(f"签到设置: 启用={ENABLE_SIGNIN} 时间={SIGNIN_TIME} | 签退设置: 启用={ENABLE_SIGNOUT} 窗口={SIGNOUT_TIME}~{SIGNOUT_END_TIME}")
 
     usernames, passwords = None, None
     if action:
@@ -173,90 +297,157 @@ def main(users, action=False):
     current_dayofweek = get_current_dayofweek(action)
     # 计算今天应该预约的座位数
     today_reservation_num = sum(1 for d in users if should_reserve_today(d.get('daysofweek'), current_dayofweek))
-    if today_reservation_num == 0:
-        logging.info("今天无需预约任何座位!")
+
+    # 限制启动时间：当前时间若已超过所有执行窗口，直接退出，避免空跑/无限重复请求
+    latest_end = "00:00:00"
+    if ENABLE_RESERVE or ENABLE_SIGNIN:
+        latest_end = max(latest_end, ENDTIME)
+    if ENABLE_SIGNOUT:
+        latest_end = max(latest_end, SIGNOUT_END_TIME)
+    if get_current_time(action) > latest_end:
+        logging.info(f"当前时间已超过所有执行窗口（最晚 {latest_end}），程序退出")
         return
 
-    success_list = [False] * len(users)
+    # ============ 1) 预约 + 签到（共用 [STARTTIME, ENDTIME] 窗口） ============
+    if (ENABLE_RESERVE or ENABLE_SIGNIN) and today_reservation_num > 0:
+        if get_current_time(action) >= ENDTIME:
+            logging.info("当前时间已超过预约/签到窗口（ENDTIME），跳过预约与签到")
+        else:
+            success_list = [False] * len(users)
+            tasks = []
+            signin_tasks = None
+            signin_done, signin_fail_msg = {}, {}
 
-    # 计算登录开始时间 = 开放时间 - 提前秒数（例如 08:00:00 - 5s = 07:59:55）
-    login_start_time = time_add_seconds(STARTTIME, -LOGIN_AHEAD)
+            # 预约：提前到 STARTTIME - LOGIN_AHEAD 登录（仅预约需要）
+            if ENABLE_RESERVE:
+                login_start_time = time_add_seconds(STARTTIME, -LOGIN_AHEAD)
+                wait_until(login_start_time, action)
+                logging.info(f"到达登录时间 {login_start_time}，开始登录（提前 {LOGIN_AHEAD} 秒）")
+                tasks = login_all(users, usernames, passwords, action)
 
-    # 1) 等待到登录开始时间（GitHub 当前时间未到则等待）
-    wait_until(login_start_time, action)
-    logging.info(f"到达登录时间 {login_start_time}，开始登录（提前 {LOGIN_AHEAD} 秒）")
-    tasks = login_all(users, usernames, passwords, action)
+            # 统一等待到窗口起点（预约从 STARTTIME；仅签到则从 SIGNIN_TIME）
+            window_start = STARTTIME if ENABLE_RESERVE else SIGNIN_TIME
+            wait_until(window_start, action)
+            logging.info(f"到达执行时间 {window_start}，开始执行（窗口 {window_start}~{ENDTIME}）")
 
-    # 2) 等待到正式开放时间，再正式提交预约
-    wait_until(STARTTIME, action)
-    logging.info(f"到达预约时间 {STARTTIME}，正式开始预约")
+            # 主循环：预约不断重试；到 SIGNIN_TIME 后同时执行签到，直到超时或全部完成
+            attempt_times = 0
+            while get_current_time(action) < ENDTIME:
+                attempt_times += 1
+                now = get_current_time(action)
 
-    # 3) 主循环：不断尝试预约直到超时或全部成功
-    attempt_times = 0
-    while get_current_time(action) < ENDTIME:
-        attempt_times += 1
-        success_list = reserve_all(tasks, action, success_list)
+                # 预约重试
+                if ENABLE_RESERVE:
+                    success_list = reserve_all(tasks, action, success_list)
+                    logging.info(f"尝试 #{attempt_times} | 当前时间 {now} | 成功 {sum(success_list)}/{today_reservation_num}")
 
-        current_time = get_current_time(action)
-        logging.info(f"尝试 #{attempt_times} | 当前时间 {current_time} | 成功 {sum(success_list)}/{today_reservation_num}")
+                # 检查签到时间：到 SIGNIN_TIME 后执行签到（8:00-8:01 既预约也签到）
+                if ENABLE_SIGNIN and now >= SIGNIN_TIME:
+                    if signin_tasks is None:
+                        logging.info(f"到达签到时间 {SIGNIN_TIME}，开始签到")
+                        signin_tasks = _sign_login(users, usernames, passwords, action, "签到")
+                    _sign_retry_once(signin_tasks, "签到", signin_done, signin_fail_msg,
+                                     lambda s, r, seat: s.execute_signin(r, seat))
 
-        # 检查是否全部预约成功
-        if sum(success_list) == today_reservation_num:
-            logging.info("已成功预订所有座位!")
-            # send_success_email(tasks)
-            return
+                # 退出条件：预约全部成功 且 签到全部完成
+                reserve_done = (not ENABLE_RESERVE) or (sum(success_list) == today_reservation_num)
+                signin_done_all = (not ENABLE_SIGNIN) or (signin_tasks is not None and _sign_all_done(signin_tasks, signin_done))
+                if reserve_done and signin_done_all:
+                    logging.info("预约与签到任务完成，结束本次窗口循环")
+                    break
 
-        # 控制轮询间隔，避免登录失败/无任务时空转
-        time.sleep(SLEEPTIME)
+                time.sleep(SLEEPTIME)
 
-    # 超时仍未全部成功时，发送失败邮件提醒（仅当预约失败或开始时间大于结束时间）
-    failures = collect_failures(users, success_list, action, usernames)
-    if failures and ENABLE_EMAIL:
-        logging.info(f"预约存在失败项，发送失败邮件提醒，共 {len(failures)} 条")
-        send_failure_email(failures)
-    elif failures:
-        logging.info(f"预约存在 {len(failures)} 条失败项，但邮箱提醒已关闭（ENABLE_EMAIL=False），不发送邮件")
-    else:
-        logging.info("所有座位均已成功预约，不发送邮件")
+            # 预约失败邮件（原逻辑）
+            if ENABLE_RESERVE:
+                failures = collect_failures(users, success_list, action, usernames)
+                if failures and ENABLE_EMAIL:
+                    logging.info(f"预约存在失败项，发送失败邮件提醒，共 {len(failures)} 条")
+                    send_failure_email(failures)
+                elif failures:
+                    logging.info(f"预约存在 {len(failures)} 条失败项，但邮箱提醒已关闭（ENABLE_EMAIL=False），不发送邮件")
+                else:
+                    logging.info("所有座位均已成功预约，不发送邮件")
+
+            # 签到失败邮件
+            if ENABLE_SIGNIN and signin_tasks is not None:
+                _send_sign_failures(signin_tasks, signin_done, signin_fail_msg, "签到")
+    elif today_reservation_num == 0:
+        logging.info("今天无需预约任何座位!")
+
+    # ============ 2) 签退（窗口 [SIGNOUT_TIME, SIGNOUT_END_TIME]） ============
+    # 仅当已进入"签退时段"（SIGNOUT_TIME 前 SIGNOUT_LEAD 秒内）才执行签退；
+    # 早间运行在 ENDTIME 退出后不会傻等到晚上，签退由晚间定时器单独触发。
+    if ENABLE_SIGNOUT and today_reservation_num > 0:
+        now = get_current_time(action)
+        signout_gate = time_add_seconds(SIGNOUT_TIME, -SIGNOUT_LEAD)
+        if now >= SIGNOUT_END_TIME:
+            logging.info("当前时间已超过签退窗口（SIGNOUT_END_TIME），跳过签退")
+        elif now >= signout_gate:
+            signout_all(users, usernames, passwords, action)
+        else:
+            logging.info(f"当前时间 {now} 未进入签退时段（{signout_gate} 之后才执行），本次跳过签退")
 
 
 def debug(users, action=False):
-    """调试模式：单次预约并发送邮件"""
+    """调试模式：立即同步测试预约、签到与签退（不等待时间点，顺序执行一次）"""
     logging.info(f"调试模式启动 ({'action' if action else 'preview'})")
-    logging.info(f"配置: 睡眠={SLEEPTIME}s 滑块={ENABLE_SLIDER} 次日={RESERVE_NEXT_DAY}")
-    
+    logging.info("调试：立即执行 预约 + 签到 + 签退，不等待 STARTTIME / SIGNIN_TIME / SIGNOUT_TIME")
+
     if action:
         usernames, passwords = get_user_credentials(action)
-    
+
     current_dayofweek = get_current_dayofweek(action)
-    
+
     for index, user in enumerate(users):
         username, password, times, roomid, seatid, daysofweek = user.values()
-        
+
         # 座位ID转为列表（若为字符串）
         if isinstance(seatid, str):
             seatid = [seatid]
-        
-        # 检查今天是否需要预约
-        if current_dayofweek not in daysofweek:
-            logging.info("今天没有预订")
+
+        # 检查今天是否需要操作
+        if not should_reserve_today(daysofweek, current_dayofweek):
+            logging.info(f"用户 {username} 今天无需操作，跳过")
             continue
-        
+
         if action:
             username, password = usernames.split(',')[index], passwords.split(',')[index]
-        
-        logging.info(f"预约: {username} - {times} - {seatid}")
-        
-        # 执行预约
-        s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY, segment_interval=SEGMENT_INTERVAL)
+
+        logging.info(f"===== 调试账号 {username} 房间 {roomid} 座位 {seatid} =====")
+
+        # 1) 立即预约（保留原调试的预约逻辑）
+        r = reserve(
+            sleep_time=SLEEPTIME,
+            max_attempt=MAX_ATTEMPT,
+            enable_slider=ENABLE_SLIDER,
+            reserve_next_day=RESERVE_NEXT_DAY,
+            segment_interval=SEGMENT_INTERVAL,
+        )
+        r.get_login_status()
+        r.login(username, password)
+        suc = r.submit(times, roomid, seatid, action)
+        logging.info(f"预约结果 {username}: 成功={suc}")
+        if suc and r.success_results:
+            r.send_all_results_email()
+
+        # 2) 立即签到 / 签退（复用 SeatSignIn，与预约同一套登录逻辑）
+        s = SeatSignIn()
         s.get_login_status()
-        s.login(username, password)
-        suc = s.submit(times, roomid, seatid, action)
-        
-        # 发送邮件并返回
-        if suc and s.success_results:
-            s.send_all_results_email()
-        return
+        login_ok, login_msg = s.login(username, password)
+        if not login_ok:
+            logging.error(f"用户 {username} 登录失败: {login_msg}")
+            continue
+
+        # 3) 立即测试签到
+        for seat in seatid:
+            res = s.execute_signin(roomid, seat)
+            logging.info(f"签到结果 {username} - 房间{roomid} 座位{seat}: 成功={res.get('success')} | {res.get('message')}")
+
+        # 4) 立即测试签退
+        for seat in seatid:
+            res = s.execute_signout(roomid, seat)
+            logging.info(f"签退结果 {username} - 房间{roomid} 座位{seat}: 成功={res.get('success')} | {res.get('message')}")
 
 def get_roomid(args1, args2):
     """获取房间ID（用于探测）"""
