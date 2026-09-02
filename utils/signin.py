@@ -87,10 +87,16 @@ class SeatSignIn:
         result = signin.execute_signout(roomid="18888", seatid="188")
     """
 
-    def __init__(self):
+    def __init__(self, session=None):
         # 复用 reserve 类的登录与 session（与预约同一套登录逻辑，确保可用）
-        self.reserve = reserve()
-        self.requests = self.reserve.requests
+        if session is not None:
+            self.requests = session
+            # 不再需要 reserve 实例
+            self.reserve = None
+        else:
+            # 原有逻辑：复用 reserve 类创建新会话
+            self.reserve = reserve()
+            self.requests = self.reserve.requests
 
         # API 端点
         self.sign_url = "https://office.chaoxing.com/data/apps/seat/sign"
