@@ -416,5 +416,7 @@ Action 模式下，`USERNAMES` / `PASSWORDS` 会按索引覆盖 `config.json` �
 **Q5：邮件发送失败？**
 请确认 `config.json` 中 `mail.auth.pass` 使用的是邮箱**授权码**（而非登录密码），并正确填写 SMTP 主机和端口。
 
-**Q6：签退提示"非法签退操作"？**
-签退要求当前座位**已签到**。请先执行签到（或确认签到已成功），再执行签退。另外注意：超星的 `leave` 接口是"暂离"，真正的签退接口是 `signback`，本项目已使用正确接口。
+本项目基于以下开源项目修改，在此感谢！
+
+https://github.com/Holmes2718/JSU-Book_a_Seat_on_Superstar_Learning_Platform.git
+https://github.com/holdmeintosleep/ChaoXingReserveSeat.git
