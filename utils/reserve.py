@@ -94,14 +94,6 @@ class reserve:
         # 学校/院系的加密 ID（deptIdEnc），用于选座页与提交接口；为固定值，从选座页 URL 或抓包获取
         self.deptIdEnc = config.get("deptIdEnc", "")
         
-        # HTTP 会话
-        self.requests = requests.session()
-        # 关键：忽略系统代理 / 环境变量代理，直连服务器。
-        # Windows 上 requests 会读取系统代理（如 127.0.0.1:7890 的 Clash），
-        # 一旦代理软件未正确接管本地流量，就会抛 ProxyError / FileNotFoundError 导致连不上。
-        # chaoxing 是国内服务，直连即可，这里强制关闭代理读取（只影响本脚本，不影响浏览器）。
-        self.requests.trust_env = False
-
         # 与抓包一致的移动端 User-Agent（Android Chrome），用于所有请求。
         # 请求头中不再手动指定 Host，requests 会根据目标 URL 自动填充正确的 Host，
         # 避免登录后切换域名（passport2 -> office）时 Host 头错乱导致服务器返回登录页。
@@ -110,12 +102,16 @@ class reserve:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/151.0.0.0 Mobile Safari/537.36"
         )
-        self.requests.headers.update({
-            "User-Agent": self.user_agent,
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-        })
+
+        # HTTP 会话
+        self.requests = self._new_session()
+
+        # 登录健壮性配置：
+        # 云函数（阿里云 FC）出口 IP 可能被超星 WAF 拦截并 302 到 passport403.html（自循环），
+        # requests 默认 allow_redirects=True 且上限 30 次会抛 TooManyRedirects("Exceeded 30 redirects")。
+        # 这里登录 POST 不跟随重定向，并对瞬时失败做重试，提高夜间登录成功率。
+        self._login_max_attempt = 3      # 登录失败后的最大重试次数
+        self._login_retry_interval = 1.0 # 登录重试的基础间隔（秒）
 
         # 登录接口请求头（passport2.chaoxing.com）
         self.login_headers = {
@@ -159,6 +155,25 @@ class reserve:
         self.segment_interval = segment_interval
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+    def _new_session(self):
+        """创建一个新的 requests.Session（忽略系统代理，统一 UA/Accept 头）
+
+        登录失败重试时也会调用，重建一个干净会话，避免上一次失败的重定向链污染 Cookie。
+        """
+        s = requests.session()
+        # 关键：忽略系统代理 / 环境变量代理，直连服务器。
+        # Windows 上 requests 会读取系统代理（如 127.0.0.1:7890 的 Clash），
+        # 一旦代理软件未正确接管本地流量，就会抛 ProxyError / FileNotFoundError 导致连不上。
+        # chaoxing 是国内服务，直连即可，这里强制关闭代理读取（只影响本脚本，不影响浏览器）。
+        s.trust_env = False
+        s.headers.update({
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+        })
+        return s
+
     def _get_page_token(self, roomid, day):
         """获取预约“选座页”的 submit_enc 值（后续 MD5 签名的种子）
 
@@ -194,42 +209,73 @@ class reserve:
         return ""
 
     def get_login_status(self):
-        """获取登录状态（初始化会话，让服务器写入 JSESSIONID 等前置 Cookie）"""
-        try:
-            self.requests.get(url=self.login_page, headers=self.login_headers, verify=False)
-        except Exception as e:
-            # 获取登录页面失败不影响后续登录，仅记录
-            logging.warning(f"获取登录页面失败（可忽略）: {e}")
+        """（已停用）初始化登录会话。
+
+        原实现会 GET passport2 的 mlogin 登录页以获取前置 Cookie，但在云函数出口 IP 上
+        该页面会被超星 WAF 302 到 passport403.html 并自循环，最终抛
+        TooManyRedirects("Exceeded 30 redirects")。实测跳过此页、直接 POST fanyalogin
+        即可登录成功，因此保留方法签名（兼容调用方）但不再发起请求。
+        """
+        logging.info("跳过登录页预请求：mlogin 在云函数出口 IP 上会被 403，直接 POST 登录即可")
 
     def login(self, username, password):
         raw_username = username
-        username = AES_Encrypt(username)
-        password = AES_Encrypt(password)
+        enc_username = AES_Encrypt(username)
+        enc_password = AES_Encrypt(password)
         parm = {
             "fid": "-1",
-            "uname": username,
-            "password": password,
-            "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
+            "uname": enc_username,
+            "password": enc_password,
+            # 登录后跳转目标。旧值写死成某个具体座位（id=4219&seatNum=380），与实际座位不符；
+            # 登录本身并不依赖具体座位，这里指向座位模块入口即可。
+            "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2F",
             "t": "true",
         }
-        try:
-            # 关键修复：登录凭证必须以表单体（data=）提交，而非 URL 查询参数（params=）。
-            # 抓包显示 fanyalogin 的 Content-Type 为 application/x-www-form-urlencoded 且有请求体。
-            # 使用 data= 才能让服务器正确回写 p_auth_token / UID / _uid 等会话 Cookie。
-            jsons = self.requests.post(
-                url=self.login_url, data=parm, headers=self.login_headers, verify=False
-            )
-            obj = jsons.json()
-        except Exception as e:
-            logging.error(f"用户 {raw_username} 登录请求异常: {e}")
-            return (False, str(e))
-        if obj.get("status"):
-            logging.info(f"用户 {raw_username} 登录成功")
-            return (True, "")
-        else:
-            msg = obj.get("msg2") or obj.get("msg") or "未知错误"
-            logging.error(f"用户 {raw_username} 登录失败，原因: {msg}，服务器返回: {obj}")
-            return (False, msg)
+
+        last_msg = "未知错误"
+        for attempt in range(1, self._login_max_attempt + 1):
+            if attempt > 1:
+                # 重建会话：上一次失败可能是重定向链污染了 Cookie，重试前换一个干净会话
+                self.requests = self._new_session()
+                logging.info(f"用户 {raw_username} 登录重试 {attempt}/{self._login_max_attempt}")
+
+            try:
+                # 关键修复：登录凭证必须以表单体（data=）提交，而非 URL 查询参数（params=）。
+                # 抓包显示 fanyalogin 的 Content-Type 为 application/x-www-form-urlencoded 且有请求体。
+                # 使用 data= 才能让服务器正确回写 p_auth_token / UID / _uid 等会话 Cookie。
+                # allow_redirects=False：成功路径直接返回 JSON，无需跟随重定向；
+                # 若被 WAF 重定向则记录目标并重试，而不是盲目跟随导致 Exceeded 30 redirects。
+                jsons = self.requests.post(
+                    url=self.login_url, data=parm, headers=self.login_headers,
+                    verify=False, allow_redirects=False,
+                )
+            except Exception as e:
+                last_msg = str(e)
+                logging.error(f"用户 {raw_username} 登录请求异常: {e}")
+            else:
+                if jsons.is_redirect:
+                    loc = jsons.headers.get("Location")
+                    last_msg = f"登录被重定向 (HTTP {jsons.status_code}) -> {loc}"
+                    logging.warning(f"用户 {raw_username} {last_msg}")
+                else:
+                    try:
+                        obj = jsons.json()
+                    except Exception as e:
+                        # 返回非 JSON（可能是 WAF 校验页 / 半截响应），视为瞬时故障，进入重试
+                        last_msg = f"登录响应非 JSON: {jsons.text[:200]}"
+                        logging.error(f"用户 {raw_username} {last_msg}")
+                    else:
+                        if obj.get("status"):
+                            logging.info(f"用户 {raw_username} 登录成功")
+                            return (True, "")
+                        # 服务端明确拒绝（如“用户名或密码错误”），重试无意义，直接返回
+                        last_msg = obj.get("msg2") or obj.get("msg") or "未知错误"
+                        logging.error(f"用户 {raw_username} 登录失败，原因: {last_msg}，服务器返回: {obj}")
+                        return (False, last_msg)
+
+            time.sleep(self._login_retry_interval * attempt)
+
+        return (False, last_msg)
 
     def roomid(self, encode):
         """列出所有可用的房间及座位信息"""

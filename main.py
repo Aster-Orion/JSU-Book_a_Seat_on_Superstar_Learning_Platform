@@ -88,7 +88,6 @@ def login_all(users, usernames, passwords, action):
 
         # 创建预约实例并登录（此时不提交预约）
         s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY, segment_interval=SEGMENT_INTERVAL)
-        s.get_login_status()
         login_ok, login_msg = s.login(username, password)
         if not login_ok:
             logging.error(f"用户 {username} 登录失败，跳过该用户预约，原因: {login_msg}")
@@ -211,7 +210,6 @@ def _sign_login(users, usernames, passwords, action, action_name, reserve_tasks=
         if s is None:
             logging.info(f"开始{action_name}登录: {username}")
             s = SeatSignIn()
-            s.get_login_status()
             login_ok, login_msg = s.login(username, password)
             if not login_ok:
                 logging.error(f"用户 {username} {action_name}登录失败，原因: {login_msg}")
@@ -242,6 +240,10 @@ def _sign_retry_once(tasks, action_name, done, fail_msg, execute):
             if result.get("success"):
                 done[key] = True
                 logging.info(f"{action_name}成功 {task['username']} - 房间{task['roomid']} 座位{seat}")
+            elif result.get("terminal"):
+                # 终态（无预约 / 已签退 / 预约已失效等）：无需再重试，也不计入失败邮件
+                done[key] = True
+                logging.info(f"{action_name}跳过 {task['username']} - 房间{task['roomid']} 座位{seat}: {result.get('message')}")
             else:
                 fail_msg[key] = result.get("message")
                 logging.info(f"{action_name}失败 {task['username']} - 房间{task['roomid']} 座位{seat}: {result.get('message')}")
@@ -447,7 +449,6 @@ def debug(users, action=False):
             reserve_next_day=RESERVE_NEXT_DAY,
             segment_interval=SEGMENT_INTERVAL,
         )
-        r.get_login_status()
         r.login(username, password)
         suc = r.submit(times, roomid, seatid, action)
         logging.info(f"预约结果 {username}: 成功={suc}")
@@ -456,7 +457,6 @@ def debug(users, action=False):
 
         # 2) 立即签到 / 签退（复用 SeatSignIn，与预约同一套登录逻辑）
         s = SeatSignIn()
-        s.get_login_status()
         login_ok, login_msg = s.login(username, password)
         if not login_ok:
             logging.error(f"用户 {username} 登录失败: {login_msg}")
@@ -478,7 +478,6 @@ def get_roomid(args1, args2):
     password = input("请输入密码: ")
     
     s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY, segment_interval=SEGMENT_INTERVAL)
-    s.get_login_status()
     s.login(username=username, password=password)
 
     deptid_enc = input("请输入deptIdEnc: ")

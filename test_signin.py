@@ -43,7 +43,6 @@ def main():
 
         logging.info(f"===== 测试{mode}：账号 {username} 房间 {roomid} 座位 {seatid} =====")
         s = SeatSignIn()
-        s.get_login_status()
         ok, msg = s.login(username, password)
         if not ok:
             logging.error(f"登录失败: {msg}")

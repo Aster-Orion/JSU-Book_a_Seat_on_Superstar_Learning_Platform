@@ -22,6 +22,13 @@ import logging
 
 from .reserve import reserve
 
+# 签到/签退失败消息命中这些关键词时视为“终态”（无需再重试），
+# 例如预约已结束、已签退、无预约等。命中后停止反复请求，避免触发 WAF。
+_SIGN_TERMINAL_KEYWORDS = (
+    "没有预约", "无预约", "未找到", "不存在", "已签退", "已签到",
+    "已取消", "已失效", "已过期", "已释放", "无效",
+)
+
 
 def send_sign_failure_email(failures, action_name):
     """发送签到 / 签退失败邮件提醒
@@ -115,7 +122,9 @@ class SeatSignIn:
 
     def get_login_status(self):
         """初始化登录会话（获取前置 Cookie）"""
-        self.reserve.get_login_status()
+        # 复用预约会话时 self.reserve 为 None，此时无需（也无法）做预请求
+        if self.reserve is not None:
+            self.reserve.get_login_status()
 
     def login(self, username, password):
         """登录，返回 (success: bool, message: str)"""
@@ -124,11 +133,20 @@ class SeatSignIn:
     # ─── 预约信息查询 ─────────────────────────────────────────
 
     def _get_json(self, url):
-        """GET 请求并解析 JSON；解析失败返回 {"raw": text} 便于排错"""
+        """GET 请求并解析 JSON；解析失败返回 {"raw": text} 便于排错
+
+        allow_redirects=False：云函数出口 IP 可能被超星 WAF 拦截而无限重定向，
+        不跟随重定向可避免 TooManyRedirects("Exceeded 30 redirects")，并把跳转目标记录下来。
+        """
         try:
             resp = self.requests.get(
-                url, headers=self.api_headers, verify=False, timeout=10
+                url, headers=self.api_headers, verify=False, timeout=10,
+                allow_redirects=False,
             )
+            if resp.is_redirect:
+                loc = resp.headers.get("Location")
+                logging.warning(f"请求被重定向 {url}: HTTP {resp.status_code} -> {loc}")
+                return {"raw": f"重定向 (HTTP {resp.status_code}) -> {loc}"}
             text = resp.content.decode("utf-8")
         except Exception as e:
             logging.error(f"请求失败 {url}: {e}")
@@ -165,16 +183,51 @@ class SeatSignIn:
             return reserve_id
         return self.find_reserve_id(roomid, seatid)
 
+    def _resolve_reserve_id_with_status(self, roomid, seatid, reserve_id):
+        """解析 reserveId，返回 (reserve_id, terminal)。
+
+        terminal=True 表示已确认当前没有可操作的预约（预约已结束/已释放等），
+        调用方应停止对该座位的重试；terminal=False 且 reserve_id 为空表示
+        “获取预约信息失败（网络/被重定向）”，可重试。
+        """
+        if reserve_id:
+            return reserve_id, False
+
+        url = f"{self.reserve_info_url}?id={roomid}&seatNum={seatid}"
+        data = self._get_json(url)
+
+        # 请求失败（网络异常 / 被重定向）：无法判断，按可重试处理
+        if "raw" in data:
+            return "", False
+
+        # 接口成功返回：能从 seatReserve.id 取到即为有效预约
+        if data.get("success"):
+            seat_reserve = (data.get("data") or {}).get("seatReserve") or {}
+            rid = str(seat_reserve.get("id", ""))
+            if rid:
+                return rid, False
+            # 成功响应但确无预约 → 终态
+            return "", True
+
+        # 服务端返回失败（非网络错误）：保守按可重试处理
+        return "", False
+
     def _request_sign_action(self, url, action_name, roomid, seatid, reserve_id):
         """执行一次签到 / 签退请求（GET id={reserveId}）"""
-        reserve_id = self._resolve_reserve_id(roomid, seatid, reserve_id)
+        reserve_id, terminal = self._resolve_reserve_id_with_status(roomid, seatid, reserve_id)
         if not reserve_id:
+            msg = f"未找到预约ID，无法{action_name} (room={roomid}, seat={seatid})"
+            if terminal:
+                logging.info(f"{action_name}跳过（无有效预约）: room={roomid}, seat={seatid}")
+            else:
+                logging.warning(f"{action_name}暂时无法执行: {msg}")
             return {
                 "success": False,
-                "message": f"未找到预约ID，无法{action_name} (room={roomid}, seat={seatid})",
+                "message": msg,
                 "reserve_id": "",
                 "roomid": roomid,
                 "seatid": seatid,
+                "terminal": terminal,
             }
 
         logging.info(
@@ -192,16 +245,23 @@ class SeatSignIn:
                 "reserve_id": reserve_id,
                 "roomid": roomid,
                 "seatid": seatid,
+                "terminal": False,
             }
 
         msg = data.get("msg") or data.get("message") or json.dumps(data, ensure_ascii=False)[:200]
-        logging.warning(f"{action_name}失败: {msg}")
+        msg = str(msg)
+        terminal = any(k in msg for k in _SIGN_TERMINAL_KEYWORDS)
+        if terminal:
+            logging.info(f"{action_name}无需重试（{msg}）: room={roomid}, seat={seatid}, reserveId={reserve_id}")
+        else:
+            logging.warning(f"{action_name}失败: {msg}")
         return {
             "success": False,
-            "message": str(msg),
+            "message": msg,
             "reserve_id": reserve_id,
             "roomid": roomid,
             "seatid": seatid,
+            "terminal": terminal,
         }
 
     def execute_signin(self, roomid="", seatid="", reserve_id=""):
